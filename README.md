@@ -12,11 +12,11 @@ uvicorn main:app --port 8004 --reload
 
 ## Env vars
 
-| Var | Default | Purpose |
-|---|---|---|
-| `TOOL_MOCK_MODE` | `true` | When true (or a binary is missing), tools return canned mock output instead of shelling out. |
-| `TOOL_TIMEOUT_SECONDS` | `120` | Per-tool subprocess timeout. |
-| `PORT` | `8004` | Used only when running `python3 main.py` directly. |
+| Var                    | Default | Purpose                                                                                      |
+| ---------------------- | ------- | -------------------------------------------------------------------------------------------- |
+| `TOOL_MOCK_MODE`       | `true`  | When true (or a binary is missing), tools return canned mock output instead of shelling out. |
+| `TOOL_TIMEOUT_SECONDS` | `120`   | Per-tool subprocess timeout.                                                                 |
+| `PORT`                 | `8004`  | Used only when running `python3 main.py` directly.                                           |
 
 ## Endpoints
 
@@ -96,6 +96,16 @@ to capture real output shapes, not as a security test).
   real verification. `wfuzz` itself wasn't patched (lower priority — `ffuf`
   covers the same fuzzing need); same shim approach would likely work for it
   too if you decide you need it.
+- `httpx` — **data-loss bug, not a tool-output bug**: `httpx`'s `parse_output()`
+  and `mock_output()` originally only set `live`/`status_code`/`title`/`tech`
+  keys, but `main.py`'s aggregation loop only reads `findings` and
+  `signal_candidates`. Since `.get(..., [])` silently defaults instead of
+  erroring, this never crashed — it just meant httpx's data was computed and
+  then silently dropped from every API response. Fixed by also populating
+  `findings` with a synthesized entry carrying the same data. Caught only by
+  asserting on the _final aggregated API response_, not by checking each
+  tool's own dict shape in isolation — worth remembering if you extend this
+  further: per-tool unit checks aren't enough, also assert end-to-end.
 - Default `TOOL_TIMEOUT_SECONDS` raised from 120 to 300 — real scans
   (corsy, testssl.sh in particular) routinely exceed 120s.
 
@@ -106,7 +116,77 @@ are reasonable guesses, not confirmed real schemas — verify the same way (run
 the real binary against an approved lab target, diff the actual JSON against
 what `parse_output()` expects) before relying on them for grading.
 
+**Verified against real tool output, bugs found and fixed (round 2 — Keerthi):**
 
+- `ffuf` — same file-vs-stdout mistake as corsy/testssl_deep: `-o -` does
+  NOT emit JSON to stdout on this ffuf version (confirmed on Kali — `-o -`
+  only prints the bare discovered-path list, identical to running with no
+  `-o` at all). Fixed: wrapper now writes JSON to a real temp file via
+  `-o <path>` and reads it back, same pattern as corsy. Hardened further:
+  preserves `words`, `lines`, `content-type`, `duration`, `redirectlocation`,
+  and `host` on every finding (previously only `input`/`status`/`length`/
+  `url`); maps a wider signal set (`exposed_directory`, `exposed_admin_panel`,
+  `login_endpoint`, `api_endpoint`, `backup_file`, `configuration_file`,
+  `sensitive_file`, `exposed_git`, `exposed_env`, `exposed_database_dump`) on
+  top of the original `admin_route_exposed`/`backup_archive_files_found`;
+  guards against a non-dict output file, a non-list `results` field, and
+  non-dict entries inside `results` without raising. Zero-length Windows
+  reserved-name filtering is unchanged.
+- `nuclei_active` — command was already correct (`-jsonl -silent` streams
+  real JSON-lines to stdout, confirmed against demo.testfire.net, which
+  returned 0 matches because the target was unreachable on 443, not a
+  wrapper issue). Parser now preserves template name, template id, template
+  path, severity, matched-at, matched URL, host, type, matcher-name,
+  extracted-results, curl-command, and timestamp per finding (previously
+  only template/severity/matched_at/description). Signal mapping expanded
+  from just `missing_security_headers`/`confirmed_active_vulnerability` to
+  keyword-based detection across CSP, HSTS, X-Frame-Options, CORS, directory
+  listing, exposed panels/git/env/backups, and SQLi/XSS/RCE/SSRF/LFI-RFI
+  template families. Unknown/unmapped templates still parse correctly (info
+  preserved, just no extra signal beyond the severity-based fallback). Each
+  JSONL line is parsed independently — one malformed line is skipped and
+  logged to `errors`, the rest of the scan still parses. Not yet exercised
+  against a real positive match.
+- `kxss` — command confirmed correct (piping a single URL into kxss works
+  as designed). Verified the empty-result path against demo.testfire.net
+  (`/` and `/search.aspx?q=test` — neither reflects unfiltered). Parser
+  rewritten as a small state machine (was a strict block split) so it
+  tolerates blank lines inside/between blocks, extra whitespace, and
+  unrecognized future lines without breaking; also recognizes an optional
+  `Severity:` field for forward-compatibility with future kxss versions.
+  Empty stdout is still "no findings," not an error.
+- `wpscan_full` — command confirmed correct: `--format json --no-banner`
+  produces valid JSON on real runs (verified twice against
+  demo.testfire.net, including an SSL-handshake-failure `scan_aborted` case
+  and a not-WordPress `scan_aborted` case). Parser now reads core version
+  number + release date, per-plugin version/location/vulnerabilities (with
+  `fixed_in` and `references.url`/`references.cve`), per-theme version +
+  vulnerabilities, enumerated usernames (when `-e u` ran and found
+  accounts), and `interesting_findings` categorized into config-backup,
+  debug-log, directory-listing, xmlrpc, and readme-exposure signals.
+  `scan_aborted` is still treated as a normal informational outcome, not an
+  error. Every section (`plugins`, `themes`, `users`,
+  `interesting_findings`) is optional — a missing or malformed section is
+  skipped, not a crash. Malformed/truncated top-level JSON is caught and
+  reported in `errors` instead of raising.
+
+**General robustness pass across all four (this round):** every wrapper now
+guarantees the same baseline schema (`tool_name`, `family_id`, `target`,
+`signal_candidates`, `findings`, `errors`) even on total parse failure, via
+a shared `_empty_result()` helper. `signal_candidates` is deduplicated and
+sorted on every return. `parse_output()` is also wrapped at the `run()`
+level so that if a parser bug somehow still raises, the agent returns a
+clean `errors`-populated result instead of crashing the request — no
+exception from a tool parser can escape to the FastAPI layer. All optional
+JSON fields are read with `.get()`/falsy-fallbacks rather than direct
+indexing, and unknown/extra fields in real tool output are ignored rather
+than causing a failure.
+
+**Verification environment note (Keerthi's round):** the above four were
+verified by running real binaries from a Kali box against
+`demo.testfire.net` (an explicitly-designed-to-be-scanned IBM demo app, not
+a production system), not from the restricted-egress sandbox used for the
+rest of this log.
 
 - Only scan instructor-approved lab targets, or leave `TOOL_MOCK_MODE=true`.
 - Never point this at production systems without written approval.
